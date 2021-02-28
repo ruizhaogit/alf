@@ -35,7 +35,7 @@ TracInfo = namedtuple(
     ["action_distribution", "observation", "state", "ac", "prev_action"])
 
 
-@gin.configurable
+@alf.configurable
 class TracAlgorithm(OnPolicyAlgorithm):
     """Trust-region actor-critic.
 
@@ -153,7 +153,7 @@ class TracAlgorithm(OnPolicyAlgorithm):
             self._trusted_updater = TrustedUpdater(
                 list(self._ac_algorithm._actor_network.parameters()))
         rollout_ac_info = ()
-        if experience.rollout_info != ():
+        if experience.rollout_info is not ():
             rollout_ac_info = experience.rollout_info.ac._replace(
                 action_distribution=experience.rollout_info.
                 action_distribution)

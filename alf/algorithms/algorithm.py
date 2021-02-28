@@ -571,10 +571,33 @@ class Algorithm(nn.Module):
                 dict(
                     optimizer=optimizer.__class__.__name__,
                     hypers=optimizer.defaults,
-                    parameters=[self._param_to_name[p] for p in parameters]))
+                    parameters=sorted(
+                        [self._param_to_name[p] for p in parameters])))
         json_pretty_str_info = json.dumps(obj=optimizer_info, indent=2)
 
         return json_pretty_str_info
+
+    def get_unoptimized_parameter_info(self):
+        """Return the information about the parameters not being optimized.
+
+        Note: the difference of this with the parameters contained in the optimizer
+        'None' from get_optimizer_info() is that get_optimizer_info() does not
+        traverse all the parameters (e.g., parameters in list, tuple, dict, or set).
+
+        Returns:
+            str: path of all parameters not being optimized
+        """
+        self._setup_optimizers()
+        optimized_parameters = []
+        for optimizer in self.optimizers(include_ignored_attributes=True):
+            optimized_parameters.extend(_get_optimizer_params(optimizer))
+        optimized_parameters = set(optimized_parameters)
+        all_parameters = common.get_all_parameters(self)
+        unoptimized_parameters = []
+        for name, p in all_parameters:
+            if p not in optimized_parameters:
+                unoptimized_parameters.append(name)
+        return json.dumps(obj=sorted(unoptimized_parameters), indent=2)
 
     @property
     def predict_state_spec(self):
@@ -1025,7 +1048,7 @@ class Algorithm(nn.Module):
             - params (list[(name, Parameter)]): list of parameters being updated.
         """
         masks = None
-        if (batch_info is not None and batch_info.importance_weights != ()
+        if (batch_info is not None and batch_info.importance_weights is not ()
                 and self._config.priority_replay_beta != 0):
             masks = batch_info.importance_weights.pow(
                 -self._config.priority_replay_beta).unsqueeze(0)
@@ -1374,7 +1397,7 @@ class Algorithm(nn.Module):
                 policy_state = common.reset_state_if_necessary(
                     policy_state, initial_train_state,
                     exp.step_type == StepType.FIRST)
-            elif policy_state != ():
+            elif policy_state is not ():
                 common.warning_once(
                     "Policy state is non-empty but the experience doesn't "
                     "contain the 'step_type' field. No way to reinitialize "
@@ -1439,7 +1462,7 @@ class Algorithm(nn.Module):
 
         experience = self._add_batch_info(experience, batch_info)
         loss_info = self.calc_loss(experience, train_info)
-        if loss_info.priority != ():
+        if loss_info.priority is not ():
             priority = (loss_info.priority**self._config.priority_replay_alpha
                         + self._config.priority_replay_eps)
             self._exp_replayer.update_priority(batch_info.env_ids,

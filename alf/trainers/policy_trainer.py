@@ -29,6 +29,7 @@ import alf
 from alf.algorithms.algorithm import Algorithm
 from alf.algorithms.config import TrainerConfig
 from alf.algorithms.data_transformer import create_data_transformer
+from alf.data_structures import StepType
 from alf.environments.utils import create_environment
 from alf.nest import map_structure
 from alf.tensor_specs import TensorSpec
@@ -124,8 +125,6 @@ class Trainer(object):
         """
         Trainer._trainer_progress = _TrainerProgress()
         root_dir = os.path.expanduser(config.root_dir)
-        os.makedirs(root_dir, exist_ok=True)
-        logging.get_absl_handler().use_absl_log_file(log_dir=root_dir)
         self._root_dir = root_dir
         self._train_dir = os.path.join(root_dir, 'train')
         self._eval_dir = os.path.join(root_dir, 'eval')
@@ -145,8 +144,7 @@ class Trainer(object):
         self._debug_summaries = config.debug_summaries
         self._summarize_grads_and_vars = config.summarize_grads_and_vars
         self._config = config
-
-        self._random_seed = common.set_random_seed(config.random_seed)
+        self._random_seed = config.random_seed
 
     def train(self):
         """Perform training."""
@@ -225,18 +223,21 @@ class Trainer(object):
     def _summarize_training_setting(self):
         # We need to wait for one iteration to get the operative args
         # Right just give a fixed gin file name to store operative args
-        common.write_gin_configs(self._root_dir, "configured.gin")
+        common.write_config(self._root_dir)
         with alf.summary.record_if(lambda: True):
 
             def _markdownify(paragraph):
                 return "    ".join(
                     (os.linesep + paragraph).splitlines(keepends=True))
 
-            common.summarize_gin_config()
+            common.summarize_config()
             alf.summary.text('commandline', ' '.join(sys.argv))
             alf.summary.text(
                 'optimizers',
                 _markdownify(self._algorithm.get_optimizer_info()))
+            alf.summary.text(
+                'unoptimized_parameters',
+                _markdownify(self._algorithm.get_unoptimized_parameter_info()))
             alf.summary.text('revision', git_utils.get_revision())
             alf.summary.text('diff', _markdownify(git_utils.get_diff()))
             alf.summary.text('seed', str(self._random_seed))
@@ -317,15 +318,16 @@ class RLTrainer(Trainer):
         self._num_eval_episodes = config.num_eval_episodes
         alf.summary.should_summarize_output(config.summarize_output)
 
-        env = self._create_environment(random_seed=self._random_seed)
+        env = alf.get_env()
         logging.info(
             "observation_spec=%s" % pprint.pformat(env.observation_spec()))
         logging.info("action_spec=%s" % pprint.pformat(env.action_spec()))
-        common.set_global_env(env)
-
         data_transformer = create_data_transformer(
             config.data_transformer_ctor, env.observation_spec())
         self._config.data_transformer = data_transformer
+
+        # keep compatibility with previous gin based config
+        common.set_global_env(env)
         observation_spec = data_transformer.transformed_observation_spec
         common.set_transformed_observation_spec(observation_spec)
 
@@ -363,7 +365,10 @@ class RLTrainer(Trainer):
                 alf.metrics.AverageEnvInfoMetric(
                     example_env_info=self._eval_env.reset().env_info,
                     batch_size=self._eval_env.batch_size,
-                    buffer_size=self._num_eval_episodes)
+                    buffer_size=self._num_eval_episodes),
+                alf.metrics.AverageDiscountedReturnMetric(
+                    buffer_size=self._num_eval_episodes,
+                    reward_shape=self._eval_env.reward_spec().shape),
             ]
             self._eval_summary_writer = alf.summary.create_summary_writer(
                 self._eval_dir, flush_secs=config.summaries_flush_secs)
@@ -387,6 +392,7 @@ class RLTrainer(Trainer):
         """Close all envs to release their resources."""
         for env in self._envs:
             env.close()
+        alf.close_env()
         if self._unwrapped_env is not None:
             self._unwrapped_env.close()
 
@@ -416,9 +422,9 @@ class RLTrainer(Trainer):
             logging.log_every_n_seconds(
                 logging.INFO,
                 '%s -> %s: %s time=%.3f throughput=%0.2f' %
-                (common.get_gin_file(), [
-                    os.path.basename(self._root_dir.strip('/'))
-                ], iter_num, t, int(train_steps) / t),
+                (common.get_conf_file(),
+                 os.path.basename(self._root_dir.strip('/')), iter_num, t,
+                 int(train_steps) / t),
                 n_seconds=1)
 
             if self._evaluate and (iter_num + 1) % self._eval_interval == 0:
@@ -621,6 +627,7 @@ def play(root_dir,
          future_steps=0,
          append_blank_frames=0,
          render=True,
+         render_prediction=False,
          ignored_parameter_prefixes=[]):
     """Play using the latest checkpoint under `train_dir`.
 
@@ -668,6 +675,9 @@ def play(root_dir,
         render (bool): If False, then this function only evaluates the trained
             model without calling rendering functions. This value will be ignored
             if a ``record_file`` argument is provided.
+        render_prediction (bool): If True, when using ``VideoRecorder`` to render
+            a video, extra prediction info (returned by ``predict_step()``) will
+            also be rendered by the side of video frames.
         ignored_parameter_prefixes (list[str]): ignore the parameters whose
             name has one of these prefixes in the checkpoint.
 """
@@ -688,6 +698,7 @@ def play(root_dir,
             env,
             future_steps=future_steps,
             append_blank_frames=append_blank_frames,
+            render_prediction=render_prediction,
             path=record_file)
     elif render:
         # pybullet_envs need to render() before reset() to enable mode='human'
@@ -737,6 +748,10 @@ def play(root_dir,
             episode_reward = 0.
             episode_length = 0.
             episodes += 1
+            # change the step_type to LAST before being observed by metrics
+            # to ensure the episodic information will be updated correctly
+            time_step = time_step._replace(
+                step_type=torch.full_like(time_step.step_type, StepType.LAST))
             # observe the last step
             for m in metrics:
                 m(time_step.cpu())

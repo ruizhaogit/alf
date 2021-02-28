@@ -21,7 +21,6 @@ import abc
 from collections import OrderedDict
 import copy
 import cProfile
-import gin
 import math
 import numpy as np
 import random
@@ -116,7 +115,7 @@ class AlfEnvironmentBaseWrapper(AlfEnvironment):
 
 
 # Used in ALF
-@gin.configurable
+@alf.configurable
 class TimeLimit(AlfEnvironmentBaseWrapper):
     """End episodes after specified number of steps."""
 
@@ -156,7 +155,7 @@ class TimeLimit(AlfEnvironmentBaseWrapper):
         return self._duration
 
 
-@gin.configurable
+@alf.configurable
 class PerformanceProfiler(AlfEnvironmentBaseWrapper):
     """End episodes after specified number of steps."""
 
@@ -287,7 +286,7 @@ class GoalReplayEnvWrapper(AlfEnvironmentBaseWrapper):
 
 
 # Used in ALF
-@gin.configurable
+@alf.configurable
 class NonEpisodicAgent(AlfEnvironmentBaseWrapper):
     """
     Make the agent non-episodic by replacing all termination time steps with
@@ -340,7 +339,7 @@ class NonEpisodicAgent(AlfEnvironmentBaseWrapper):
 
 
 # Used in ALF
-@gin.configurable
+@alf.configurable
 class RandomFirstEpisodeLength(AlfEnvironmentBaseWrapper):
     """Randomize the length of the first episode.
 
@@ -391,7 +390,7 @@ class RandomFirstEpisodeLength(AlfEnvironmentBaseWrapper):
         return time_step
 
 
-@gin.configurable(whitelist=[])
+@alf.configurable(whitelist=[])
 class ActionObservationWrapper(AlfEnvironmentBaseWrapper):
     def __init__(self, env):
         """Add prev_action to observation.
@@ -431,7 +430,7 @@ class ActionObservationWrapper(AlfEnvironmentBaseWrapper):
                 prev_action=time_step.prev_action))
 
 
-@gin.configurable
+@alf.configurable
 class ScalarRewardWrapper(AlfEnvironmentBaseWrapper):
     """A wrapper that converts a vector reward to a scalar reward by averaging
     reward dims with a weight vector."""
@@ -620,7 +619,7 @@ class MultitaskWrapper(AlfEnvironment):
             env.seed(seed)
 
 
-@gin.configurable(blacklist=['env'])
+@alf.configurable(blacklist=['env'])
 class CurriculumWrapper(AlfEnvironmentBaseWrapper):
     """A wrapper to provide automatic curriculum task selection.
 
@@ -629,7 +628,7 @@ class CurriculumWrapper(AlfEnvironmentBaseWrapper):
     reward increases faster than other tasks.
 
     The progress of a task is defined as the difference between its current score
-    and its past score.
+    and its past score divided by the average episode length for that task.
     """
 
     def __init__(self,
@@ -654,7 +653,8 @@ class CurriculumWrapper(AlfEnvironmentBaseWrapper):
         num_tasks = env.num_tasks
         task_names = env.task_names
         batch_size = env.batch_size
-        self._episode_rewards = torch.zeros(batch_size)
+        self._episode_rewards = torch.zeros(batch_size, device='cpu')
+        self._episode_lengths = torch.zeros(batch_size, device='cpu')
         assert (
             len(env.action_spec()) == 2 and 'action' in env.action_spec()
             and 'task_id' in env.action_spec()
@@ -684,6 +684,7 @@ class CurriculumWrapper(AlfEnvironmentBaseWrapper):
         self._warmup_period = warmup_period * num_tasks
         self._scale = math.log(progress_favor)
         self._total_count = 0
+        self._current_episode_lengths = torch.zeros(num_tasks, device='cpu')
         self._current_scores = torch.zeros(num_tasks, device='cpu')
         self._past_scores = torch.zeros(num_tasks, device='cpu')
         self._task_probs = torch.ones(num_tasks, device='cpu') / num_tasks
@@ -700,9 +701,13 @@ class CurriculumWrapper(AlfEnvironmentBaseWrapper):
         return torch.multinomial(
             self._task_probs, num_samples=num_samples, replacement=True)
 
-    def _update_curriculum(self, task_ids, task_scores):
+    def _update_curriculum(self, task_ids, task_scores, task_episode_lengths):
         for task_id, task_score in zip(task_ids, task_scores):
             self._total_count += 1
+            self._current_episode_lengths[
+                task_ids] += self._current_score_update_rate * (
+                    task_episode_lengths -
+                    self._current_episode_lengths[task_ids])
             self._task_counts[task_id] += 1
             self._current_scores[
                 task_id] += self._current_score_update_rate * (
@@ -710,7 +715,16 @@ class CurriculumWrapper(AlfEnvironmentBaseWrapper):
             self._past_scores[task_id] += self._past_score_update_rate * (
                 task_score - self._past_scores[task_id])
 
-        progresses = (self._current_scores - self._past_scores).relu()
+        # obtain the unbiased estimate of current scores and past scores
+        current_scores = self._current_scores / (1 - (
+            1 - self._current_score_update_rate)**self._task_counts + 1e-30)
+        past_scores = self._past_scores / (
+            1 - (1 - self._past_score_update_rate)**self._task_counts + 1e-30)
+        current_episode_lengths = self._current_episode_lengths / (1 - (
+            1 - self._current_score_update_rate)**self._task_counts + 1e-30)
+        current_episode_lengths += 1e-30
+        progresses = (
+            current_scores - past_scores).relu() / current_episode_lengths
         max_progress = progresses.max()
         progresses = progresses / (max_progress + 1e-30)
         # Gradually increase scale from 0 to self._scale so that we tend to do
@@ -738,14 +752,18 @@ class CurriculumWrapper(AlfEnvironmentBaseWrapper):
         time_step_cpu = time_step.cpu()
         info = time_step_cpu.env_info
 
-        is_first_step = time_step.is_first()
+        is_first_step = time_step_cpu.is_first()
         self._episode_rewards[is_first_step] = 0
-        self._episode_rewards += alf.math.sum_to_leftmost(time_step.reward, 1)
+        self._episode_lengths[is_first_step] = 0
+        self._episode_rewards += alf.math.sum_to_leftmost(
+            time_step_cpu.reward, 1)
+        self._episode_lengths += 1
         is_last_step = time_step.cpu().is_last()
         last_env_ids = is_last_step.nonzero(as_tuple=True)[0]
         if last_env_ids.numel() > 0:
             self._update_curriculum(task_ids[last_env_ids],
-                                    self._episode_rewards[last_env_ids])
+                                    self._episode_rewards[last_env_ids],
+                                    self._episode_lengths[last_env_ids])
             new_task_ids = self._sample_tasks(last_env_ids.numel())
             self._current_task_ids[last_env_ids] = new_task_ids
 

@@ -13,7 +13,6 @@
 # limitations under the License.
 """Some basic layers."""
 
-import gin
 import copy
 
 import numpy as np
@@ -21,8 +20,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import alf
 from alf.initializers import variance_scaling_init
-from alf.nest.utils import get_outer_rank
+from alf.nest.utils import get_outer_rank, NestConcat, NestMultiply, NestSum
 from alf.tensor_specs import TensorSpec
 from alf.utils import common
 from alf.utils.math_ops import identity
@@ -169,7 +169,7 @@ class BatchSquash(object):
                      tuple(tensor.shape[1:])))
 
 
-@gin.configurable
+@alf.configurable
 class OneHot(nn.Module):
     def __init__(self, num_classes):
         super().__init__()
@@ -180,7 +180,7 @@ class OneHot(nn.Module):
             input, num_classes=self._num_classes).to(torch.float32)
 
 
-@gin.configurable
+@alf.configurable
 class FixedDecodingLayer(nn.Module):
     """A layer that uses a set of fixed basis for decoding the inputs."""
 
@@ -303,7 +303,7 @@ class FixedDecodingLayer(nn.Module):
         return self._B.weight
 
 
-@gin.configurable
+@alf.configurable
 class FC(nn.Module):
     """Fully connected layer."""
 
@@ -344,6 +344,8 @@ class FC(nn.Module):
 
         super(FC, self).__init__()
 
+        self._input_size = input_size
+        self._output_size = output_size
         self._activation = activation
         self._weight = nn.Parameter(torch.Tensor(output_size, input_size))
         if use_bias:
@@ -366,6 +368,14 @@ class FC(nn.Module):
         else:
             self._ln = None
         self.reset_parameters()
+
+    @property
+    def input_size(self):
+        return self._input_size
+
+    @property
+    def output_size(self):
+        return self._output_size
 
     def reset_parameters(self):
         """Initialize the parameters."""
@@ -425,7 +435,147 @@ class FC(nn.Module):
         return ParallelFC(n=n, **self._kwargs)
 
 
-@gin.configurable
+class FCBatchEnsemble(FC):
+    r"""The BatchEnsemble for FC layer.
+
+    BatchEnsemble is proposed in `Wen et. al. BatchEnsemble: An Alternative Approach
+    to Efficient Ensemble and Lifelong Learning <https://arxiv.org/abs/2002.06715>`_
+
+    In a nutshell, a tuple of vector :math:`(r_k, s_k)` is maintained for ensemble
+    member k in addition to the original FC weight matrix w. For input x, the
+    result for ensemble member k is calculated as :math:`(W \circ (s_k r_k^T)) x`.
+    This can be more efficiently calculated as :math:`(W (x \circ r_k)) \circ s_k`.
+    Note that for each sample in a batch, a random ensemble member will used for it
+    if ``ensemble_ids`` is not provided to ``forward()``.
+
+    """
+
+    def __init__(self,
+                 input_size,
+                 output_size,
+                 ensemble_size,
+                 output_ensemble_ids=True,
+                 activation=identity,
+                 use_bias=True,
+                 use_bn=False,
+                 use_ln=False,
+                 kernel_initializer=None,
+                 kernel_init_gain=1.0,
+                 bias_init_range=0.):
+        """
+        Args:
+            input_size (int): input size
+            output_size (int): output size
+            ensemble_size (int): ensemble size
+            output_ensemble_ids (bool): If True, the forward() function will return
+                a tuple of (result, ensemble_ids). If False, the forward() function
+                will return result only.
+            activation (Callable): activation function
+            use_bias (bool): whether use bias
+            use_bn (bool): whether use batch normalization.
+            use_ln (bool): whether use layer normalization
+            kernel_initializer (Callable): initializer for the FC layer kernel.
+                If none is provided a ``variance_scaling_initializer`` with gain as
+                ``kernel_init_gain`` will be used.
+            kernel_init_gain (float): a scaling factor (gain) applied to
+                the std of kernel init distribution. It will be ignored if
+                ``kernel_initializer`` is not None.
+            bias_init_range (float): biases are initialized uniformly in
+                [-bias_init_range, bias_init_range]
+        """
+        nn.Module.__init__(self)
+        self._r = nn.Parameter(torch.Tensor(ensemble_size, input_size))
+        self._s = nn.Parameter(torch.Tensor(ensemble_size, output_size))
+        self._ensemble_bias = nn.Parameter(
+            torch.Tensor(ensemble_size, output_size))
+        self._use_ensemble_bias = use_bias
+        self._ensemble_size = ensemble_size
+        self._output_ensemble_ids = output_ensemble_ids
+        self._bias_init_range = bias_init_range
+        super().__init__(
+            input_size,
+            output_size,
+            activation=activation,
+            use_bias=False,
+            use_bn=use_bn,
+            use_ln=use_ln,
+            kernel_initializer=kernel_initializer,
+            kernel_init_gain=kernel_init_gain)
+
+    def reset_parameters(self):
+        """Reinitialize parameters."""
+        super().reset_parameters()
+        # Both r and s are initialized to +1/-1 according to Appendix B
+        torch.randint(
+            2, size=self._r.shape, dtype=torch.float32, out=self._r.data)
+        torch.randint(
+            2, size=self._s.shape, dtype=torch.float32, out=self._s.data)
+        self._r.data.mul_(2)
+        self._r.data.sub_(1)
+        self._s.data.mul_(2)
+        self._s.data.sub_(1)
+        if self._use_ensemble_bias:
+            nn.init.uniform_(
+                self._ensemble_bias.data,
+                a=-self._bias_init_range,
+                b=self._bias_init_range)
+
+    def forward(self, inputs):
+        """Forward computation.
+
+        Args:
+            inputs (Tensor|tuple): if a Tensor, its shape should be ``[batch_size, input_size]`` or
+                ``[batch_size, ..., input_size]``. And a random ensemble id will be
+                generated for each sample in the batch. If a tuple, it should
+                contain two tensors. The first one is the data tensor with shape
+                ``[batch_size, input_size]`` or ``[batch_size, ..., input_size]``.
+                The second one is ensemble_ids indicating which ensemble member each
+                sample should use. Its shape should be [batch_size], and all elements
+                should be in [0, ensemble_size).
+        Returns:
+            tuple if ``output_ensemble_ids`` is True,
+            - Tensor: with shape as ``inputs.shape[:-1] + (output_size,)``
+            - LongTensor: if enseble_ids is provided, this is same as ``ensemble_ids``,
+                otherwise a randomly generated ensemble_ids is returned
+            Tensor if ``output_ensemble_ids`` is False. The result of FC.
+        """
+        if type(inputs) == tuple:
+            inputs, ensemble_ids = inputs
+        else:
+            ensemble_ids = torch.randint(
+                self._ensemble_size, size=(inputs.shape[0], ))
+        batch_size = inputs.shape[0]
+        output_size, input_size = self._weight.shape
+        r = self._r[ensemble_ids]  # [batch_size, input_size]
+        s = self._s[ensemble_ids]  # [batch_size, output_size]
+        if inputs.ndim > 2:
+            ones = [1] * (inputs.ndim - 2)
+            r = r.reshape(batch_size, *ones, input_size)
+            s = s.reshape(batch_size, *ones, output_size)
+        y = (inputs * r).matmul(self._weight.t())
+        y = y * s
+        if self._use_ensemble_bias:
+            bias = self._ensemble_bias[ensemble_ids]
+            if inputs.ndim > 2:
+                bias = bias.reshape(batch_size, *ones, output_size)
+            y += bias
+        if self._use_ln:
+            if not self._use_ensemble_bias:
+                self._ln.bias.data.zero_()
+            y = self._ln(y)
+        if self._use_bn:
+            if not self._use_ensemble_bias:
+                self._bn.bias.data.zero_()
+            y = self._bn(y)
+
+        y = self._activation(y)
+        if self._output_ensemble_ids:
+            return y, ensemble_ids
+        else:
+            return y
+
+
+@alf.configurable
 class ParallelFC(nn.Module):
     """Parallel FC layer."""
 
@@ -555,7 +705,7 @@ class ParallelFC(nn.Module):
         return self._bias
 
 
-@gin.configurable
+@alf.configurable
 class Conv2D(nn.Module):
     """2D Convolution Layer."""
 
@@ -645,7 +795,7 @@ class Conv2D(nn.Module):
         return self._conv2d.bias
 
 
-@gin.configurable
+@alf.configurable
 class ParallelConv2D(nn.Module):
     def __init__(self,
                  in_channels,
@@ -798,7 +948,7 @@ class ParallelConv2D(nn.Module):
         return self._bias
 
 
-@gin.configurable
+@alf.configurable
 class ConvTranspose2D(nn.Module):
     def __init__(self,
                  in_channels,
@@ -878,7 +1028,7 @@ class ConvTranspose2D(nn.Module):
         return self._conv_trans2d.bias
 
 
-@gin.configurable
+@alf.configurable
 class ParallelConvTranspose2D(nn.Module):
     def __init__(self,
                  in_channels,
@@ -1026,7 +1176,7 @@ class ParallelConvTranspose2D(nn.Module):
         return self._bias
 
 
-@gin.configurable
+@alf.configurable
 class ParamFC(nn.Module):
     def __init__(self,
                  input_size,
@@ -1037,9 +1187,9 @@ class ParamFC(nn.Module):
                  kernel_init_gain=1.0,
                  bias_init_value=0.0):
         """A fully connected layer that does not maintain its own weight and bias,
-        but accepts both from users. If the given parameter (weight and bias) 
+        but accepts both from users. If the given parameter (weight and bias)
         tensor has an extra batch dimension (first dimension), it performs
-        parallel FC operation. 
+        parallel FC operation.
 
         Args:
             input_size (int): input size
@@ -1140,13 +1290,13 @@ class ParamFC(nn.Module):
         """Forward
 
         Args:
-            inputs (torch.Tensor): with shape ``[B, D] (groups=1)`` 
+            inputs (torch.Tensor): with shape ``[B, D] (groups=1)``
                                         or ``[B, n, D] (groups=n)``
                 where the meaning of the symbols are:
                 - ``B``: batch size
                 - ``n``: number of replicas
-                - ``D``: input dimension 
-                When the shape of inputs is ``[B, D]``, all the n linear 
+                - ``D``: input dimension
+                When the shape of inputs is ``[B, D]``, all the n linear
                 operations will take inputs as the same shared inputs.
                 When the shape of inputs is ``[B, n, D]``, each linear operator
                 will have its own input data by slicing inputs.
@@ -1187,7 +1337,7 @@ class ParamFC(nn.Module):
         return self._activation(res)
 
 
-@gin.configurable
+@alf.configurable
 class ParamConv2D(nn.Module):
     def __init__(self,
                  in_channels,
@@ -1202,9 +1352,9 @@ class ParamConv2D(nn.Module):
                  kernel_init_gain=1.0,
                  bias_init_value=0.0):
         """A 2D conv layer that does not maintain its own weight and bias,
-        but accepts both from users. If the given parameter (weight and bias) 
+        but accepts both from users. If the given parameter (weight and bias)
         tensor has an extra batch dimension (first dimension), it performs
-        parallel FC operation. 
+        parallel FC operation.
 
         Args:
             in_channels (int): channels of the input image
@@ -1327,7 +1477,7 @@ class ParamConv2D(nn.Module):
         """Forward
 
         Args:
-            img (torch.Tensor): with shape ``[B, C, H, W] (groups=1)`` 
+            img (torch.Tensor): with shape ``[B, C, H, W] (groups=1)``
                                         or ``[B, n, C, H, W] (groups=n)``
                 where the meaning of the symbols are:
                 - ``B``: batch size
@@ -1398,7 +1548,7 @@ class ParamConv2D(nn.Module):
         return res
 
 
-@gin.configurable
+@alf.configurable
 class Reshape(nn.Module):
     def __init__(self, shape):
         """A layer for reshape the tensor.
@@ -1442,7 +1592,7 @@ def _conv_transpose_2d(in_channels,
         bias=bias)
 
 
-@gin.configurable(
+@alf.configurable(
     whitelist=['v1_5', 'with_batch_normalization', 'keep_conv_bias'])
 class BottleneckBlock(nn.Module):
     """Bottleneck block for ResNet.
@@ -1840,3 +1990,125 @@ class TransformerBlock(nn.Module):
             z = z.squeeze(1)
 
         return z
+
+
+class Lambda(nn.Module):
+    """Wrap a function as an nn.Module."""
+
+    def __init__(self, func):
+        """
+        Args:
+            func (Callable): a function that calculate the output given the input.
+                It should be parameterless.
+        """
+        super().__init__()
+        self._func = func
+
+    def forward(self, x):
+        return self._func(x)
+
+
+class GFT(nn.Module):
+    """Guided Feature Transformation.
+
+    This class implements the GFT model proposed in the following paper:
+
+    `Yu et al. Guided Feature Transformation (GFT): A Neural language Grounding
+    Module for Embodied Agents, CoRL 2018 <https://arxiv.org/pdf/1805.08329.pdf>`_
+    """
+
+    def __init__(self, num_transformations, image_channels, language_dim):
+        super().__init__()
+        self._t_layers = nn.ModuleList([
+            FC(language_dim, (1 + image_channels) * image_channels)
+            for k in range(num_transformations)
+        ])
+        self._ones = torch.ones(1, 1, 1)
+
+    def forward(self, input):
+        """
+        Args:
+            input (tuple): the tuple of image features and sentence embedding.
+        Returns:
+            Tensor: same shape as input[0]
+        """
+        image, sentence = input
+        batch_size, channels = image.shape[:2]
+        # [B, C, W*H]
+        cnn_out = image.view(batch_size, channels, -1)
+        ## compute K transformation matrices
+        ts = [
+            l(sentence).view(batch_size, channels, channels + 1)
+            for l in self._t_layers
+        ]
+
+        ones = self._ones.expand(batch_size, 1, cnn_out.shape[-1])
+        for t in ts:
+            # [B, C+1, W*H]
+            cnn_out = torch.cat((cnn_out, ones), dim=1)
+            # [B, C, W*H] <= [B, C, C+1] * [B, C+1, W*H]
+            cnn_out = torch.relu_(torch.matmul(t, cnn_out))
+        return cnn_out.reshape(*image.shape)
+
+    def reset_parameters(self):
+        for l in self._t_layers:
+            l.reset_parameters()
+
+
+class GetFields(nn.Module):
+    """Get the fields from a nested input."""
+
+    def __init__(self, fields):
+        """
+        Args
+            fields (nested str): the path of the fields to be retrieved. Each str
+                in ``fields`` represents a path to the field with '.' separating
+                the field name at different level.
+        """
+        super().__init__()
+        self._fields = fields
+
+    def forward(self, input):
+        return alf.nest.map_structure(
+            lambda path: alf.nest.get_field(input, path), self._fields)
+
+
+class Sum(nn.Module):
+    """Sum over given dimension(s).
+
+    Note that batch dimention is not counted for dim. This means that
+    dim=0 means the dimension after batch dimension.
+    """
+
+    def __init__(self, dim):
+        """
+        Args:
+            dim (int|tuple[int]): the dimension(s) to be summed.
+        """
+        super().__init__()
+        dim = alf.nest.map_structure(lambda d: d + 1 if d >= 0 else d, dim)
+        self._dim = dim
+
+    def forward(self, input):
+        return input.sum(dim=self._dim)
+
+
+def reset_parameters(module):
+    """Reset the parameters for ``module``.
+
+    Args:
+        module (nn.Module):
+    Returns:
+        None
+    Raises:
+        ValueError: fail to reset the parameters for ``module``
+    """
+    if hasattr(module, 'reset_parameters'):
+        module.reset_parameters()
+    elif isinstance(module, nn.Sequential):
+        for l in module:
+            reset_parameters(l)
+    elif isinstance(module, nn.Module):
+        if len(list(module.parameters())) > 0:
+            raise ValueError(
+                "Cannot reset_parameter for layer type %s." % type(module))

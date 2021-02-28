@@ -19,6 +19,7 @@ import gin
 
 import torch
 
+import alf
 from alf.algorithms.actor_critic_algorithm import ActorCriticAlgorithm
 from alf.algorithms.algorithm import Algorithm
 from alf.algorithms.agent_helpers import AgentHelper
@@ -43,7 +44,7 @@ AgentInfo = namedtuple(
     default_value=())
 
 
-@gin.configurable
+@alf.configurable
 class Agent(OnPolicyAlgorithm):
     """Agent is a master algorithm that integrates different algorithms together.
     """
@@ -326,7 +327,7 @@ class Agent(OnPolicyAlgorithm):
 
     def calc_loss(self, experience, train_info: AgentInfo):
         """Calculate loss."""
-        if experience.rollout_info == ():
+        if experience.rollout_info is ():
             experience = experience._replace(
                 reward=self.calc_training_reward(experience.reward,
                                                  train_info))

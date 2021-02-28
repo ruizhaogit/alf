@@ -24,12 +24,14 @@ import glob
 import math
 import numpy as np
 import os
+import pprint
 import random
 import shutil
 import time
 import torch
 import torch.distributions as td
 import torch.nn as nn
+import types
 from typing import Callable
 
 import alf
@@ -428,6 +430,122 @@ def get_gin_file():
         return ''
 
 
+ALF_CONFIG_FILE = 'alf_config.py'
+
+
+def get_conf_file():
+    """Get the configuration file.
+
+    If ``FLAGS.conf`` is not set, find alf_config.py or configured.gin under
+    ``FLAGS.root_dir`` and returns it. If there is no 'conf' flag defined,
+    return None.
+
+    Returns:
+        str: the name of the conf file. None if there is no conf file
+    """
+    if not hasattr(flags.FLAGS, "conf") or not hasattr(flags.FLAGS,
+                                                       "gin_file"):
+        return None
+
+    conf_file = getattr(flags.FLAGS, 'conf', None)
+    if conf_file is not None:
+        return conf_file
+    conf_file = getattr(flags.FLAGS, 'gin_file', None)
+    if conf_file is not None:
+        return conf_file
+
+    root_dir = os.path.expanduser(flags.FLAGS.root_dir)
+    conf_file = os.path.join(root_dir, ALF_CONFIG_FILE)
+    if os.path.exists(conf_file):
+        return conf_file
+    gin_file = glob.glob(os.path.join(root_dir, "*.gin"))
+    if not gin_file:
+        return None
+    assert len(
+        gin_file) == 1, "Multiple *.gin files are found in %s" % root_dir
+    return gin_file[0]
+
+
+def parse_conf_file(conf_file):
+    """Parse config from file.
+
+    It also looks for FLAGS.gin_param and FLAGS.conf_param for extra configs.
+
+    Note: a global environment will be created (which can be obtained by
+    alf.get_env()) and random seed will be initialized by this function using
+    common.set_random_seed().
+
+    Args:
+        conf_file (str): the full path to the config file
+    """
+    if conf_file.endswith(".gin"):
+        gin_params = getattr(flags.FLAGS, 'gin_param', None)
+        gin.parse_config_files_and_bindings([conf_file], gin_params)
+        # Create the global environment and initialize random seed
+        alf.get_env()
+    else:
+        conf_params = getattr(flags.FLAGS, 'conf_param', None)
+        alf.parse_config(conf_file, conf_params)
+
+
+def summarize_config():
+    """Write config to TensorBoard."""
+
+    def _format(configs):
+        paragraph = pprint.pformat(dict(configs))
+        return "    ".join((os.linesep + paragraph).splitlines(keepends=True))
+
+    conf_file = get_conf_file()
+    if conf_file is None or conf_file.endswith('.gin'):
+        return summarize_gin_config()
+
+    operative_configs = alf.get_operative_configs()
+    inoperative_configs = alf.get_inoperative_configs()
+    alf.summary.text('config/operative_config', _format(operative_configs))
+    if inoperative_configs:
+        alf.summary.text('gin/inoperative_config',
+                         _format(inoperative_configs))
+
+
+def write_config(root_dir):
+    """Write config to a file under directory ``root_dir``
+
+    Configs from FLAGS.conf_param are also recorded.
+
+    Args:
+        root_dir (str): directory path
+    """
+    conf_file = get_conf_file()
+    if conf_file is None or conf_file.endswith('.gin'):
+        return write_gin_configs(root_dir, 'configured.gin')
+
+    root_dir = os.path.expanduser(root_dir)
+    alf_config_file = os.path.join(root_dir, ALF_CONFIG_FILE)
+    os.makedirs(root_dir, exist_ok=True)
+    conf_params = getattr(flags.FLAGS, 'conf_param', None)
+    config = ''
+    if conf_params:
+        config += "########### config from commandline ###########\n\n"
+        config += "import alf\n"
+        config += "alf.pre_config({\n"
+        for conf_param in conf_params:
+            pos = conf_param.find('=')
+            if pos == -1:
+                raise ValueError("conf_param should have a format of "
+                                 "'CONFIG_NAME=VALUE': %s" % conf_param)
+            config_name = conf_param[:pos]
+            config_value = conf_param[pos + 1:]
+            config += "    '%s': %s,\n" % (config_name, config_value)
+        config += "})\n\n"
+        config += "########### end config from commandline ###########\n\n"
+    f = open(conf_file, 'r')
+    config += f.read()
+    f.close()
+    f = open(alf_config_file, 'w')
+    f.write(config)
+    f.close()
+
+
 def get_initial_policy_state(batch_size, policy_state_spec):
     """
     Return zero tensors as the initial policy states.
@@ -454,14 +572,6 @@ def get_initial_time_step(env, first_env_id=0):
     """
     time_step = env.current_time_step()
     return time_step._replace(env_id=time_step.env_id + first_env_id)
-
-
-def transpose2(x, dim1, dim2):
-    """Transpose two axes ``dim1`` and ``dim2`` of a tensor."""
-    perm = list(range(len(x.shape)))
-    perm[dim1] = dim2
-    perm[dim2] = dim1
-    return tf.transpose(x, perm)
 
 
 _env = None
@@ -602,7 +712,7 @@ def active_action_target_entropy(active_action_portion=0.2, min_entropy=0.3):
     """
     assert active_action_portion <= 1.0 and active_action_portion > 0
     action_spec = get_action_spec()
-    assert tensor_spec.is_discrete(
+    assert action_spec.is_discrete(
         action_spec), "only support discrete actions!"
     num_actions = action_spec.maximum - action_spec.minimum + 1
     return max(math.log(num_actions * active_action_portion), min_entropy)
@@ -873,3 +983,75 @@ def check_numerics(nested):
                                      nested, nested_finite)
         assert all(alf.nest.flatten(nested_finite)), (
             "Some tensor in nested is not finite: %s" % bad)
+
+
+def get_all_parameters(obj):
+    """Get all the parameters under ``obj`` and its descendents.
+
+    Note: This function assumes all the parameters can be reached through tuple,
+    list, dict, set, nn.Module or the attributes of an object. If a parameter is
+    held in a strange way, it will not be included by this function.
+
+    Args:
+        obj (object): will look for paramters under this object.
+    Returns:
+        list: list of (path, Parameters)
+    """
+    all_parameters = []
+    memo = set()
+    unprocessed = [(obj, '')]
+    # BFS for all subobjects
+    while unprocessed:
+        obj, path = unprocessed.pop(0)
+        if isinstance(obj, types.ModuleType):
+            # Do not traverse into a module. There are too much stuff inside a
+            # module.
+            continue
+        if isinstance(obj, nn.Parameter):
+            all_parameters.append((path, obj))
+            continue
+        if path:
+            path += '.'
+        if nest.is_namedtuple(obj):
+            for name, value in nest.extract_fields_from_nest(obj):
+                if id(value) not in memo:
+                    unprocessed.append((value, path + str(name)))
+                    memo.add(id(value))
+        elif isinstance(obj, dict):
+            # The keys of a generic dict are not necessarily str, and cannot be
+            # handled by nest.extract_fields_from_nest.
+            for name, value, in obj.items():
+                if id(value) not in memo:
+                    unprocessed.append((value, path + str(name)))
+                    memo.add(id(value))
+        elif isinstance(obj, (tuple, list, set)):
+            for i, value in enumerate(obj):
+                if id(value) not in memo:
+                    unprocessed.append((value, path + str(i)))
+                    memo.add(id(value))
+        elif isinstance(obj, nn.Module):
+            for name, m in obj.named_children():
+                if id(m) not in memo:
+                    unprocessed.append((m, path + name))
+                    memo.add(id(m))
+            for name, p in obj.named_parameters():
+                if id(p) not in memo:
+                    unprocessed.append((p, path + name))
+                    memo.add(id(p))
+        attribute_names = dir(obj)
+        for name in attribute_names:
+            if name.startswith('__') and name.endswith('__'):
+                # Ignore system attributes,
+                continue
+            attr = None
+            try:
+                attr = getattr(obj, name)
+            except:
+                # some attrbutes are property function, which may raise exception
+                # when called in a wrong context (e.g. Algorithm.experience_spec)
+                pass
+            if attr is None or id(attr) in memo:
+                continue
+            unprocessed.append((attr, path + name))
+            memo.add(id(attr))
+    return all_parameters

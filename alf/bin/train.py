@@ -56,8 +56,10 @@ from alf.trainers import policy_trainer
 flags.DEFINE_string('ml_type', 'rl', 'type of the learning task')
 flags.DEFINE_string('root_dir', os.getenv('TEST_UNDECLARED_OUTPUTS_DIR'),
                     'Root directory for writing logs/summaries/checkpoints.')
-flags.DEFINE_multi_string('gin_file', None, 'Paths to the gin-config files.')
+flags.DEFINE_string('gin_file', None, 'Path to the gin-config file.')
 flags.DEFINE_multi_string('gin_param', None, 'Gin binding parameters.')
+flags.DEFINE_string('conf', None, 'Path to the alf config file.')
+flags.DEFINE_multi_string('conf_param', None, 'Config binding parameters.')
 
 FLAGS = flags.FLAGS
 
@@ -82,10 +84,16 @@ def train_eval(ml_type, root_dir):
 
 
 def main(_):
-    gin_file = common.get_gin_file()
     FLAGS.alsologtostderr = True
-    gin.parse_config_files_and_bindings(gin_file, FLAGS.gin_param)
-    train_eval(FLAGS.ml_type, FLAGS.root_dir)
+    root_dir = os.path.expanduser(FLAGS.root_dir)
+    os.makedirs(root_dir, exist_ok=True)
+    logging.get_absl_handler().use_absl_log_file(log_dir=root_dir)
+    conf_file = common.get_conf_file()
+    try:
+        common.parse_conf_file(conf_file)
+        train_eval(FLAGS.ml_type, FLAGS.root_dir)
+    finally:
+        alf.close_env()
 
 
 if __name__ == '__main__':

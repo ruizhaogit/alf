@@ -14,7 +14,6 @@
 """Replay buffer."""
 
 from absl import logging
-import gin
 import math
 import numpy as np
 import torch
@@ -28,14 +27,14 @@ from alf.utils.common import warning_once
 from alf.utils.data_buffer import atomic, RingBuffer
 from alf.utils import checkpoint_utils
 
-from .segment_tree import SumSegmentTree, MaxSegmentTree, MinSegmentTree
+from .segment_tree import SumSegmentTree, MaxSegmentTree
 
 BatchInfo = namedtuple(
     "BatchInfo", ["env_ids", "positions", "importance_weights"],
     default_value=())
 
 
-@gin.configurable
+@alf.configurable
 class ReplayBuffer(RingBuffer):
     """Replay buffer with RingBuffer as implementation.
 
@@ -230,12 +229,15 @@ class ReplayBuffer(RingBuffer):
                 The elements are the new priorities corresponds to experiences
                 indicated by ``(env_ids, positions)``
         """
-        # If positions are outdated, we don't update their priorities.
-        valid, = torch.where(positions >= self._current_pos[env_ids] -
-                             self._current_size[env_ids])
-        indices = self._env_id_idx_to_index(env_ids[valid],
-                                            self.circular(positions[valid]))
-        self._update_segment_tree(indices, priorities[valid])
+        with alf.device(self._device):
+            env_ids, positions, priorities = convert_device(
+                (env_ids, positions, priorities))
+            # If positions are outdated, we don't update their priorities.
+            valid, = torch.where(positions >= self._current_pos[env_ids] -
+                                 self._current_size[env_ids])
+            indices = self._env_id_idx_to_index(
+                env_ids[valid], self.circular(positions[valid]))
+            self._update_segment_tree(indices, priorities[valid])
 
     @atomic
     @torch.no_grad()
@@ -652,7 +654,7 @@ class ReplayBuffer(RingBuffer):
         step_type[env_ids, self.circular(positions)] = int(ds.StepType.LAST)
 
 
-@gin.configurable
+@alf.configurable
 def l2_dist_close_reward_fn(achieved_goal, goal, threshold=.05, device="cpu"):
     if goal.dim() == 2:  # when goals are 1-dimentional
         assert achieved_goal.dim() == goal.dim()
@@ -664,7 +666,7 @@ def l2_dist_close_reward_fn(achieved_goal, goal, threshold=.05, device="cpu"):
         -torch.ones(1, dtype=torch.float32, device=device))
 
 
-@gin.configurable
+@alf.configurable
 def hindsight_relabel_fn(buffer,
                          result,
                          info,
