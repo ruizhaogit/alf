@@ -15,6 +15,7 @@ Agent Learning Framework (ALF) is a reinforcement learning framework emphasizing
 * [Amortized SVGD](alf/algorithms/generator.py): Feng et al "Learning to Draw Samples with Amortized Stein Variational Gradient Descent"[arXiv:1707.06626](https://arxiv.org/abs/1707.06626)
 * [RND](alf/algorithms/rnd_algorithm.py): Burda et al "Exploration by Random Network Distillation" [arXiv:1810.12894](https://arxiv.org/abs/1810.12894)
 * [MINE](alf/algorithms/mi_estimator.py): Belghazi et al "Mutual Information Neural Estimation" [arXiv:1801.04062](https://arxiv.org/abs/1801.04062)
+* [MUSIC](alf/algorithms/music_algorithm.py): Zhao et al. "Mutual Information State Intrinsic Control" [ICLR 2021 Openreview](https://openreview.net/forum?id=OthEq8I5v1)
 
 ## Installation
 
@@ -82,3 +83,8 @@ python -m alf.bin.play --root_dir=LOG_DIR
   Python package gym-retro>=0.7.0 is required for this experiment and also a suitable `SuperMarioBros-Nes` rom should be obtained and imported (roms are not included in gym-retro). See [this doc](https://retro.readthedocs.io/en/latest/getting_started.html#importing-roms) on how to import roms.
 
   <img src="alf/examples/icm_super_mario_intrinsic_only.png" width = "300" height ="200" alt="super-mario-training-curve"/> <img src="alf/examples/icm_super_mario_intrinsic_only.gif" width = "300" height ="200" alt="super-mario-video"/>
+
+### MUSIC
+* [Playground with a red ball](alf/examples/music_playground.gin) and [with two balls, a red ball and a blue ball](alf/examples/music_playground_two_balls.gin).  The agent learns to interact with the objects via the MI-based internal drive.
+
+  <img src="alf/examples/music_playground.gif" width = "300" alt="Playground with a red ball"/> <img src="alf/examples/music_playground_two_balls.gif" width = "300" alt="Playground with two balls"/>

@@ -26,56 +26,57 @@ from tf_agents.trajectories.time_step import StepType
 from alf.utils.encoding_network import EncodingNetwork
 from alf.utils.common import transpose2
 
-MISCInfo = namedtuple("MISCInfo", ["reward"])
+MUSICInfo = namedtuple("MUSICInfo", ["reward"])
 
 
 @gin.configurable
-class MISCAlgorithm(Algorithm):
-    """Mutual Information-based State Control (MISC)
-    Author: Rui Zhao 
-    Work done during a research internship at Horizon Robotics. 
-    The paper is currently under review in a conference.
+class MUSICAlgorithm(Algorithm):
+    """Mutual Information State Intrinsic Control (MUSIC)
+    Author: Rui Zhao
+    Work done during a research internship at Horizon Robotics.
+    The paper is accepted by International Conference on Learning Representations (ICLR) 2021 as a spotlight.
 
-    This algorithm generates the intrinsic reward based on the mutual information 
-    estimation between the states of interests and the context states.
+    This algorithm generates the intrinsic reward based on the mutual information
+    estimation between the agent states and the surrounding states.
 
-    See Zhao et al "Self-Supervised State-Control through Intrinsic Mutual Information Rewards"
+    See Zhao et al "Mutual Information State Intrinsic Control",
+    https://openreview.net/forum?id=OthEq8I5v1
     """
 
     def __init__(self,
                  batch_size,
                  observation_spec,
                  action_spec,
-                 soi_spec,
-                 soc_spec,
+                 sos_spec,
+                 soa_spec,
                  split_observation_fn: Callable,
                  network: Network = None,
                  mi_r_scale=5000.0,
                  hidden_size=128,
                  buffer_size=100,
                  n_objects=1,
-                 name="MISCAlgorithm"):
-        """Create an MISCAlgorithm.
+                 name="MUSICAlgorithm"):
+        """Create an MUSICAlgorithm.
         
         Args:
             batch_size (int): batch size
             observation_spec (tf.TensorSpec): observation size
             action_spec (tf.TensorSpec): action size
-            soi_spec (tf.TensorSpec): state of interest size
-            soc_spec (tf.TensorSpec): state of context size
+            sos_spec (tf.TensorSpec): surrounding state size
+            soa_spec (tf.TensorSpec): agent state size
             split_observation_fn (Callable): split observation function. 
                 The input is observation and action concatenated.
-                The outputs are the context states and states of interest
+                The outputs are the agent states and the surrounding states
             network (Network): network for estimating mutual information (MI)
             mi_r_scale (float): scale factor of MI estimation
             hidden_size (int): number of hidden units in neural nets
             buffer_size (int): buffer size for the data buffer storing the trajectories 
                 for training the Mutual Information Neural Estimator
             n_objects: number of objects for estimating the mutual information reward
-            name (str): the algorithm name, "MISCAlgorithm"
+            name (str): the algorithm name, "MUSICAlgorithm"
         """
 
-        super(MISCAlgorithm, self).__init__(
+        super(MUSICAlgorithm, self).__init__(
             train_state_spec=[observation_spec, action_spec], name=name)
 
         assert isinstance(observation_spec, tf.TensorSpec), \
@@ -85,7 +86,7 @@ class MISCAlgorithm(Algorithm):
 
         if network is None:
             network = EncodingNetwork(
-                input_tensor_spec=[soc_spec, soi_spec],
+                input_tensor_spec=[soa_spec, sos_spec],
                 fc_layer_params=(hidden_size, ),
                 activation_fn='relu',
                 last_layer_size=1,
@@ -138,13 +139,13 @@ class MISCAlgorithm(Algorithm):
         """
         Args:
             inputs (tuple): observation
-            state (Tensor):  state for MISC (previous feature)
+            state (Tensor):  state for MUSIC (previous feature)
             calc_intrinsic_reward (bool): if False, only return the losses
         Returns:
             TrainStep:
                 outputs: empty tuple ()
                 state:  empty tuple ()
-                info: (MISCInfo):
+                info: (MUSICInfo):
         """
         feature_state, prev_action = inputs
         feature = tf.concat([feature_state, prev_action], axis=-1)
@@ -175,7 +176,7 @@ class MISCAlgorithm(Algorithm):
 
         intrinsic_reward = ()
         if calc_intrinsic_reward:
-            # scale/normalize the MISC intrinsic reward
+            # scale/normalize the MUSIC intrinsic reward
             if self._n_objects < 2:
                 intrinsic_reward = tf.clip_by_value(self._mi_r_scale * loss, 0,
                                                     1)
@@ -186,9 +187,9 @@ class MISCAlgorithm(Algorithm):
 
         return AlgorithmStep(
             outputs=(), state=[feature_state, prev_action], \
-            info=MISCInfo(reward=intrinsic_reward))
+            info=MUSICInfo(reward=intrinsic_reward))
 
-    def calc_loss(self, info: MISCInfo):
+    def calc_loss(self, info: MUSICInfo):
         feature_tau_sampled = self._buffer.get_batch(
             batch_size=self._buffer_size)
         feature_tau_sampled_tran = transpose2(feature_tau_sampled, 1, 0)

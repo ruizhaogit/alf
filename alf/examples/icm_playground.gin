@@ -18,7 +18,7 @@ import alf.environments.suite_socialbot
 create_environment.env_name="SocialBot-PlayGround-v0"
 create_environment.num_parallel_environments=3 # 16
 create_environment.env_load_fn=@suite_socialbot.load
-# misc
+# music
 GoalTask.move_goal_during_episode=False
 GoalTask.success_with_angle_requirement=False
 
